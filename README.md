@@ -1,5 +1,4 @@
-# Project_Visium-STalign
-
+# STalign pipeline: Xenium to Visium registration
 
 Registers a Xenium section onto the Visium section from the same donor,
 evaluates the result, and writes aligned coordinates plus diagnostic
@@ -26,8 +25,8 @@ Two files are needed and must sit in the same directory:
    LieberInstitute repository.
 4. Recovers the pixel-to-micron scale, converts Visium to microns, and
    checks the result against the chip geometry.
-5. Finds the initial placement: reflection, rotation, and translation
-   with the upper-left tissue boundaries brought into contact.
+5. Finds the initial placement: reflection first, then rotation and
+   translation searched jointly in three passes.
 6. Runs LDDMM.
 7. Evaluates against layer annotations and against shared-gene
    expression.
@@ -61,15 +60,30 @@ with the most spots is used.
 | `--xenium-dir` | `<root>/xenium` | Where the `GSM*_<donor>-cells.parquet` and `-cell_feature_matrix.h5` files live. |
 | `--workdir` | `<root>` | Where exports, the manifest and downloaded files are cached. Reused across runs. |
 | `--outdir` | `<root>/stalign_results` | Where results go, one subdirectory per donor. |
+| `--export-root` | `<workdir>/visium_exports` | Where the per-donor Visium exports are written by `spe_export.R`. Collected under one directory rather than scattered, since a full cohort produces two dozen. |
 | `--rscript` | alongside the script | Path to `spe_export.R`. |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--skip NAME [NAME ...]` | — | Donors to leave out of a batch, for instance one whose Xenium files are known bad and are being re-downloaded. |
+
+Xenium files are checked before use: both the parquet and the h5 must
+exceed 100 kB, and the h5 must carry the HDF5 magic bytes. The floor is
+deliberately low, since `cells.parquet` holds only ids, centroids and
+areas and compresses to under a megabyte for a small section; it is there
+to catch the empty file a 404 leaves behind and a transfer cut off near
+its start. A truncated download otherwise reads as a valid path and fails
+deep inside the loader, where the error names neither the donor nor the
+file.
 
 ### Registration
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--niter` | `2000` | LDDMM iterations. The diffeomorphism engages after `min(300, niter/4)`; before that only the affine is optimised. Lower values are fine for a smoke test — on well-matched sections 500 gives nearly the same answer as 2000, but sections needing more warping do not converge that fast. |
-| `--coarse-step` | `2.0` | Degrees, for the full-circle rotation sweep. Coarser is faster and risks missing a narrow optimum; on these data the optimum is several degrees wide, so 2° is ample. |
-| `--fine-step` | `0.1` | Degrees, for the ±5° refinement around the coarse winner. Finer than the width of the optimum buys nothing, which is why the reported angle carries that width rather than the sub-degree fit. |
+| `--coarse-step` | `5.0` | Degrees, for the first pass. Translation is now searched at every angle rather than fixed, so this pass is much larger and the step correspondingly coarser; the optimum is several degrees wide, so nothing is lost. |
+| `--fine-step` | `0.1` | Degrees, for the final refinement. Finer than the width of the optimum buys nothing, which is why the reported angle carries that width rather than the sub-degree fit. |
+| `--trans-span` | `3000.0` | Microns, half-width of the translation search. Must exceed the largest plausible offset between the two sections; an optimum reached at the bound means the true one lies outside it. |
 | `--cpu` | — | Force CPU even if a GPU is visible. |
 
 ### Xenium input
@@ -129,17 +143,35 @@ as `array-geometry check`; both axes should be within about 1%.
 
 | Name | Value | Why |
 |---|---|---|
-| `KERNEL_SIGMA` | `150.0` µm | Width of the Gaussian used to score a candidate placement. Each target spot takes a weighted mean of the source layer ordinal nearby and is correlated with its own domain. Unlike binning, this varies continuously with the transform, so sub-degree differences are resolvable. |
+| `KERNEL_SIGMA` | `150.0` µm | Width of the Gaussian used to score a candidate placement in the final pass. Each target spot takes a weighted mean of the source layer ordinal nearby and is correlated with its own domain. Unlike binning, this varies continuously with the transform, so sub-degree differences are resolvable. |
 | `KERNEL_MINSUP` | `8` | Minimum source cells within 3σ for a spot to contribute. |
-| `U_EDGE` | `(-1,-1)` | The direction taken as upper-left. The boundary along it is treated as the pial surface and matched between sections. |
+| `w_shape` | `0.35` | Weight on outline agreement in the coarse passes. The laminar signal is a monotonic ramp, and a ramp is unchanged by sliding parallel to its isolines, so it cannot fix translation along the layers — the same degeneracy that makes the rotation optimum flat. Tissue outline is not invariant to that sliding and supplies the missing constraint. |
+
+An earlier version instead butted the outermost band of each section
+together, treating it as the pial surface. That is a hard constraint, and
+on a section with a protruding corner it selects the corner rather than the
+pia: the source is driven off the target, and no subsequent refinement can
+override it. Entering shape as a weighted term lets the evidence decide.
 
 ### LDDMM
 
 | Name | Value | Why |
 |---|---|---|
 | `LDDMM_A_UM` | `300.0` µm | Smoothing kernel width, roughly one cortical layer, so the deformation is smooth within a layer and free to differ between layers. |
-| `sigmaM`, `sigmaB` | `0.3` | Matching and background variances. |
-| `sigmaA` | `1.0` or `0.3` | Artifact variance, chosen by the tissue-area ratio: `1.0` when the source exceeds the target by more than about 15%, otherwise `0.3`. See the note on saturation below. |
+| `sigmaM` | `1.0` | Matching variance, on images normalised to the unit interval. The STalign package default. |
+| `sigmaB` | `2.0` | Background variance. Package default. |
+| `sigmaA` | `5.0` | Artifact variance. Package default, giving a ratio to `sigmaM` of 5 against the 1 used by Clifton et al. for atlas alignment. A higher ratio makes the model readier to set unmatched source tissue aside rather than force it onto the target, which suits partially matched sections; the pairs here overlap by 62 to 97% of area. |
+
+Earlier versions inherited `sigmaM = sigmaB = 0.3` from an exploratory
+notebook and never revisited them. At that width the matching term treats
+a difference of a third of the dynamic range as decisive, and the mixture
+collapsed to a hard decision: measured across three donors, under 1% of
+cells scored between 0.2 and 0.8, and one donor returned 1.000 for every
+cell. The 0.85 threshold then selected nothing the sign of the value had
+not already decided. `match_prob_mid_frac` reports the fraction in that
+band so the behaviour stays visible, and `--sigma-m`, `--sigma-b` and
+`--sigma-a` override the defaults.
+| `MIRROR_MIN_GAP` | `0.05` | Below this the two reflection candidates are treated as a tie. The choice still stands, but it is flagged as undecided. |
 | `sigmaR` | `1e5` | Regularisation weight. |
 | `epL`, `epT`, `epV` | `1e-8`, `0.2`, `30` | Gradient-descent step sizes for the linear part, the translation and the velocity field. |
 | `MATCH_THRESH` | `0.85` | Matching-probability cutoff, following Clifton et al. |
@@ -205,9 +237,17 @@ Per donor, in `<outdir>/<donor>_STalign_result/`:
 | `<donor>_aligned_coordinates.csv` | One row per cell: native and aligned x/y in microns, the same in Visium pixels, match probability, the three filter columns, nearest spot, layer, cell type. |
 | `<donor>_aligned_coordinates.README` | Units, coordinate frames, and how to filter. Travels with the CSV. |
 | `<donor>_visium_coordinates.csv` | Spot barcode, microns, pixels, domain. |
-| `<donor>_xenium_aligned.h5ad` | Full object; `uns['alignment']` holds every parameter and metric. |
-| `<donor>_visium.h5ad` | |
 | `<donor>_metrics.json` | Everything the run produced, including the per-layer breakdown. |
+| `<donor>_run.log` | Parameters, the full console output, and the figure captions. |
+| `<donor>_report.html` | The same with the figures embedded in execution order. Open it in a browser; it reads the PNGs from the same directory, so keep them together. |
+
+AnnData objects are not written. Everything downstream needs is in the two
+CSVs, and rebuilding an object from them costs less than storing several
+hundred megabytes per donor.
+
+Figures carry panel letters and a title but no caption text. Captions live
+in the log and the HTML, so the figures can go into a manuscript where the
+caption is typeset separately.
 
 And across donors, `<outdir>/cohort_summary.csv` — one row each, written
 at the end of a run. **A single-donor run overwrites it**, so use
@@ -239,9 +279,12 @@ All tissue panels carry a 1 mm scale bar and a black frame.
 | `label_join_rho` | > 0.8 | Lieber annotations against an independent marker axis. Low means the annotation join failed, e.g. a key-prefix mismatch. |
 | `init_deg_hi − init_deg_lo` | a few degrees | Width of the rotation optimum. |
 | `fitted_affine_det` | near 1 | Rescaling LDDMM introduced on its own; the initial affine is exactly 1. Far from 1 would also flag an error in the pixel scale. |
-| `folded_frac` | 0 | Non-zero means the transform is not a diffeomorphism. |
+| `folded_frac` | 0 | Fraction of the Jacobian field whose sign differs from the median. Non-zero means the map is not injective. A *uniformly* negative field is a reflection, not folding: sections mounted face down are genuinely mirrored relative to their pair, which is why both mirror states are searched. |
+| `mirrored` | — | Whether the fitted transform reflects. Not a fault in itself. |
+| `mirror_reversed` | False | Whether the optimiser crossed `det = 0`, abandoning the reflection state settled at initialisation. This *is* a fault. |
+| `init_mirror_gap` | > 0.05 | How far apart the two reflection candidates scored. Reflection about the depth axis leaves the pia-to-white-matter order unchanged and reverses only tangential handedness, so the laminar signal is nearly blind to it. A small gap means the choice rests on almost nothing, and a wrong choice does not show in any laminar metric — the coordinates come out mirrored while still displaying the correct depth sequence. Shared-gene expression is the evidence that can settle it. |
 | `jacobian_p5`, `p95` | within ±25% of 1 | Local area change. A narrow spread means the deformation is nearly rigid. |
-| `layer_gm_wm_acc` | — | Fraction landing on the correct side of the grey–white boundary. |
+| `layer_gm_wm_acc` | — | Fraction landing on the correct side of the grey–white boundary, reported with its permutation baseline and the excess over it in standard deviations. A two-class accuracy has a floor set by the class balance rather than by 50%, so the accuracy alone leaves a near-chance result and a strong one looking alike. |
 | `layer_within_gm_rho` | — | Laminar ordering within grey matter. |
 | `expr_cosine_separation` | — | Patterned minus unpatterned cosine. Clifton et al. report 0.49 for MERFISH-to-Visium in mouse; tissue, species and panel size differ here, so treat it as a reference point rather than a target. |
 
